@@ -84,47 +84,67 @@ async def execute_mcp_tool(session, tool_name, arguments):
         return None
 
 def validate_plan(plan):
-    """Validates that the plan is a list of dictionaries with 'tool' and 'arguments'."""
-    if not isinstance(plan, list):
-        return False, "Plan is not a list."
+    """Validates that the plan is a dictionary with 'thought', 'tool_calls', and 'is_finished'."""
+    if not isinstance(plan, dict):
+        return False, "Plan is not an object."
     
-    for i, cmd in enumerate(plan):
+    if "thought" not in plan:
+        return False, "Plan is missing 'thought' key."
+    if "is_finished" not in plan:
+        return False, "Plan is missing 'is_finished' key."
+    if "tool_calls" not in plan:
+        return False, "Plan is missing 'tool_calls' key."
+        
+    if not isinstance(plan["tool_calls"], list):
+        return False, "'tool_calls' is not a list."
+    
+    for i, cmd in enumerate(plan["tool_calls"]):
         if not isinstance(cmd, dict):
-            return False, f"Command at index {i} is not a object."
+            return False, f"Command at index {i} in tool_calls is not an object."
         if "tool" not in cmd:
-            return False, f"Command at index {i} is missing 'tool' key."
+            return False, f"Command at index {i} in tool_calls is missing 'tool' key."
         if "arguments" not in cmd:
-            return False, f"Command at index {i} is missing 'arguments' key."
+            return False, f"Command at index {i} in tool_calls is missing 'arguments' key."
             
     return True, ""
 
-def generate_script_with_context(prompt, model_name, snapshot=None):
+def generate_script_with_context(prompt, model_name, snapshot=None, history=None):
     model = genai.GenerativeModel(model_name)
     
-    context_str = f"\n\nPAGE SEMANTIC SNAPSHOT (Accessibility Tree):\n{snapshot}" if snapshot else ""
+    context_str = f"\n\nCURRENT PAGE SEMANTIC SNAPSHOT (Accessibility Tree):\n{snapshot}" if snapshot else ""
+    history_str = f"\n\nACTION HISTORY (What you have done so far):\n{json.dumps(history, indent=2)}" if history else ""
     
     system_prompt = f"""
-    You are an expert browser automation engineer. Your task is to translate a natural language request into a sequence of tool calls.
+    You are an expert autonomous browser automation engineer. Your task is to achieve the user's goal by interacting with a website.
+    You operate in a ReAct (Reasoning and Acting) loop. In each step, you analyze the current page state, look at your history, and decide on the NEXT interaction.
     
     {context_str}
+    {history_str}
     
-    CRITICAL: Use `browser_run_code` for interactions. The 'code' argument MUST be a complete JavaScript async function literal.
-    Example: "async (page) => {{ await page.getByRole('button', {{ name: 'Submit' }}).click(); }}"
+    CRITICAL RULES:
+    1. Output ONLY a raw JSON object (no markdown code blocks).
+    2. The JSON MUST have exactly three keys:
+       - "thought": String. Your internal reasoning about the current state and what to do next.
+       - "tool_calls": Array. A list of tool calls for this specific step. Keep this list short (1-3 actions).
+       - "is_finished": Boolean. Set to true ONLY if the user's goal is fully achieved.
+    3. Use `browser_run_code` for interactions. The 'code' argument MUST be a complete JavaScript async function literal.
+       Example: "async (page) => {{ await page.getByRole('button', {{ name: 'Submit' }}).click(); }}"
+    4. Use semantic locators whenever possible: `getByRole`, `getByText`, `getByPlaceholder`.
     
-    Use semantic locators whenever possible:
-    - `page.getByRole(role, {{ name: '...' }})`
-    - `page.getByText('...')`
-    - `page.getByPlaceholder('...')`
-    
-    If the snapshot doesn't contain the target, write code to search for it first.
-    
-    Available tools:
+    AVAILABLE TOOLS:
     - browser_navigate(url: string)
     - browser_run_code(code: string)
     - browser_screenshot_full_page()
+    - browser_snapshot(): Use this if you need to refresh your understanding of the page.
     
-    Output ONLY a JSON array of tool calls. Each tool call MUST be an object with "tool" and "arguments" keys.
-    Example: [{{"tool": "browser_navigate", "arguments": {{"url": "https://example.com"}}}}, {{"tool": "browser_run_code", "arguments": {{"code": "async (page) => {{ await page.goto('https://example.com'); }}"}}}}]
+    OUTPUT FORMAT EXAMPLE:
+    {{
+      "thought": "The page has loaded. I see the search box. I will now enter the query.",
+      "tool_calls": [
+        {{"tool": "browser_run_code", "arguments": {{"code": "async (page) => {{ await page.getByRole('searchbox', {{ name: 'Search' }}).fill('MCP'); }}"}}}}
+      ],
+      "is_finished": false
+    }}
     """
     
     try:
@@ -165,38 +185,64 @@ async def run_smart_flow(user_prompt, model_name):
         env=os.environ.copy()
     )
     
+    history = []
+    max_steps = 10
+    step_count = 0
+    
     try:
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 log("Connected to MCP Server.", "success")
                 
-                # Step 1: Initial Planning (Navigate only)
-                initial_plan = generate_script_with_context(f"Navigate to the main site for: {user_prompt}", model_name)
-                
-                if initial_plan:
-                    # Execute navigation
-                    for cmd in initial_plan:
-                        if cmd.get("tool") == "browser_navigate":
-                            await execute_mcp_tool(session, cmd["tool"], cmd["arguments"])
+                while step_count < max_steps:
+                    step_count += 1
+                    log(f"--- Iteration {step_count} ---", "info")
                     
-                    # Step 2: Semantic Analysis
-                    log("Analyzing page semantic structure...", "step")
+                    # Step 1: Observe (Snapshot)
+                    log("Observing page state...", "step")
                     snapshot_result = await session.call_tool("browser_snapshot", {})
                     snapshot_text = snapshot_result.content[0].text if snapshot_result.content else ""
                     
-                    # Step 3: Final Planning with Context
-                    log("Planning interactions based on semantic data...", "step")
-                    final_plan = generate_script_with_context(user_prompt, model_name, snapshot=snapshot_text)
+                    # Step 2: Plan
+                    log("Thinking and planning next step...", "step")
+                    plan = generate_script_with_context(user_prompt, model_name, snapshot=snapshot_text, history=history)
                     
-                    if final_plan:
-                        with st.expander("Show Semantic Plan"):
-                            st.json(final_plan)
+                    if not plan:
+                        log("Planning failed. Stopping.", "error")
+                        break
                         
-                        # Execute remaining steps
-                        for cmd in final_plan:
-                            if cmd.get("tool") != "browser_navigate":
-                                await execute_mcp_tool(session, cmd.get("tool"), cmd.get("arguments"))
+                    log(f"🧠 AI Thought: {plan['thought']}", "info")
+                    history.append({"thought": plan["thought"]})
+                    
+                    if plan.get("is_finished"):
+                        log("Task completed successfully!", "success")
+                        # Take final screenshot
+                        await session.call_tool("browser_screenshot_full_page", {})
+                        break
+                        
+                    # Step 3: Act
+                    if not plan["tool_calls"]:
+                        log("AI returned no tool calls but task is not finished. Retrying...", "info")
+                        continue
+                        
+                    for cmd in plan["tool_calls"]:
+                        tool_name = cmd["tool"]
+                        args = cmd["arguments"]
+                        result = await execute_mcp_tool(session, tool_name, args)
+                        
+                        # Add to history
+                        history_entry = {"tool": tool_name, "arguments": args}
+                        if result and hasattr(result, 'content') and result.content:
+                            # Truncate content for history to avoid context bloat
+                            history_entry["result"] = result.content[0].text[:500] if hasattr(result.content[0], 'text') else "Image data"
+                        else:
+                            history_entry["result"] = "No output or error"
+                        history.append(history_entry)
+                
+                if step_count >= max_steps:
+                    log("Max iterations reached. Task may be incomplete.", "warning")
+                    
     except Exception as e:
         log(f"Connection/Execution Error: {str(e)}", "error")
         st.error(f"Detailed Error: {traceback.format_exc()}")
